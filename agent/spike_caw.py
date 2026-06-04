@@ -47,7 +47,7 @@ def spike():
             "deny_if": {"amount_gt": "0.005"}
         }
     }])
-    conditions = json.dumps([{"type": "tx_count", "threshold": "1"}])
+    conditions = json.dumps([{"type": "tx_count", "threshold": "10"}])
 
     pact_result = caw([
         "pact", "submit",
@@ -83,8 +83,8 @@ def spike():
     tx_result = caw([
         "tx", "transfer",
         "--token-id", "SETH",
-        "--source-address", TO_ADDRESS,
-        "--destination-address", TO_ADDRESS,
+        "--src-address", TO_ADDRESS,   # required by API even though docs say optional
+        "--dst-address", TO_ADDRESS,
         "--amount", "0.001",
         "--chain-id", "SETH",
         "--request-id", "spike-001",
