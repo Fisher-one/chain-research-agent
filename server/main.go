@@ -90,21 +90,32 @@ func handleData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 验证通过 → 返回 mock 数据
+	// 验证通过 → 获取真实数据
+	data, source, err := fetchRealData(query)
+	if err != nil {
+		log.Printf("[warn] real data fetch failed: %v, falling back to mock", err)
+		data = map[string]any{
+			"uniswap_usdc_eth_7d_volume": "1,234,567 USDC",
+			"curve_usdc_eth_7d_volume":   "456,789 USDC",
+			"note":                       "Fallback mock data",
+		}
+		source = "mock"
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(DataResponse{
-		Query: query,
-		Data: map[string]any{
-			"uniswap_usdc_eth_7d_volume": "1,234,567 USDC",
-			"curve_usdc_eth_7d_volume":   "456,789 USDC",
-			"note":                       "Mock data — replace with real Dune API call",
-		},
-		Source:    "mock",
+		Query:     query,
+		Data:      data,
+		Source:    source,
 		TxHash:    proof,
 		Timestamp: time.Now().UTC(),
 	})
-	log.Printf("[200] query=%q tx=%s", query, proof[:10]+"...")
+	short := proof
+	if len(proof) > 10 {
+		short = proof[:10] + "..."
+	}
+	log.Printf("[200] query=%q tx=%s", query, short)
 }
 
 // verifyPayment 通过 Etherscan 验证 tx hash
@@ -162,6 +173,94 @@ func verifyPayment(txHash string) error {
 	}
 
 	return nil
+}
+
+// fetchRealData 从 DefiLlama 获取真实的协议数据
+func fetchRealData(query string) (map[string]any, string, error) {
+	q := strings.ToLower(query)
+
+	// 判断查询意图：Uniswap、Curve 或两者对比
+	wantUniswap := strings.Contains(q, "uniswap")
+	wantCurve := strings.Contains(q, "curve")
+
+	result := map[string]any{}
+
+	if wantUniswap || (!wantUniswap && !wantCurve) {
+		tvl, vol, err := fetchProtocolData("uniswap")
+		if err != nil {
+			return nil, "", fmt.Errorf("uniswap: %w", err)
+		}
+		result["uniswap"] = tvl
+		result["uniswap_7d_volume_usd"] = vol
+	}
+
+	if wantCurve || (!wantUniswap && !wantCurve) {
+		tvl, vol, err := fetchProtocolData("curve")
+		if err != nil {
+			return nil, "", fmt.Errorf("curve: %w", err)
+		}
+		result["curve"] = tvl
+		result["curve_7d_volume_usd"] = vol
+	}
+
+	result["source_note"] = "Real data from DefiLlama API"
+	result["query"] = query
+	return result, "defillama", nil
+}
+
+// fetchProtocolData 从 DefiLlama 获取协议的 TVL 和交易量
+func fetchProtocolData(protocol string) (tvlData map[string]any, volume string, err error) {
+	// 获取 TVL（Curve 的 slug 是 curve-dex）
+	tvlSlug := protocol
+	if protocol == "curve" {
+		tvlSlug = "curve-dex"
+	}
+	tvlURL := fmt.Sprintf("https://api.llama.fi/protocol/%s", tvlSlug)
+	resp, err := http.Get(tvlURL)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	var data map[string]any
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, "", err
+	}
+
+	tvl := map[string]any{
+		"name":        data["name"],
+		"current_tvl": data["tvl"],
+		"category":    data["category"],
+	}
+
+	// 获取 7日交易量（dex volume）
+	// Curve 在 DefiLlama 的 DEX 名称是 curve-dex
+	dexName := protocol
+	if protocol == "curve" {
+		dexName = "curve-dex"
+	}
+	volURL := fmt.Sprintf("https://api.llama.fi/summary/dexs/%s?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true&dataType=dailyVolume", dexName)
+	resp2, err := http.Get(volURL)
+	if err != nil {
+		return tvl, "N/A", nil // 交易量获取失败不影响 TVL
+	}
+	defer resp2.Body.Close()
+
+	body2, _ := io.ReadAll(resp2.Body)
+	var volData map[string]any
+	if err := json.Unmarshal(body2, &volData); err != nil {
+		return tvl, "N/A", nil
+	}
+
+	total7d := volData["total7d"]
+	if total7d != nil {
+		volume = fmt.Sprintf("$%.0f", total7d)
+	} else {
+		volume = "N/A"
+	}
+
+	return tvl, volume, nil
 }
 
 // GET /health — 健康检查
