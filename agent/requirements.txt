@@ -1,4 +1,3 @@
-anthropic>=0.25.0
+cobo-agentic-wallet>=0.1.40
 python-dotenv>=1.0.0
 requests>=2.31.0
-cobo-waas2>=1.0.0
