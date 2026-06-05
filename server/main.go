@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,6 +23,46 @@ const (
 	ChainID         = "SETH"
 	EtherscanAPIURL = "https://api-sepolia.etherscan.io/api"
 )
+
+// ── 限速器 ────────────────────────────────────────────────────────────────────
+
+const (
+	FreeRateLimit   = 2              // 免费通道：每分钟最多 2 次
+	FreeRateWindow  = time.Minute
+	FreeSlowDelay   = 400 * time.Millisecond // 免费通道人为延迟，体现差距
+)
+
+// RateLimiter 滑动窗口限速，按 IP 计数
+type RateLimiter struct {
+	mu       sync.Mutex
+	requests map[string][]time.Time
+}
+
+var rateLimiter = &RateLimiter{requests: make(map[string][]time.Time)}
+
+// Allow 返回 true 表示本次请求放行；false 表示已超限
+func (rl *RateLimiter) Allow(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-FreeRateWindow)
+
+	var recent []time.Time
+	for _, t := range rl.requests[ip] {
+		if t.After(cutoff) {
+			recent = append(recent, t)
+		}
+	}
+
+	if len(recent) >= FreeRateLimit {
+		rl.requests[ip] = recent
+		return false
+	}
+
+	rl.requests[ip] = append(recent, now)
+	return true
+}
 
 // ── 数据结构 ──────────────────────────────────────────────────────────────────
 
@@ -57,65 +99,100 @@ type EtherscanTxResponse struct {
 
 // ── 处理器 ────────────────────────────────────────────────────────────────────
 
-// GET /data — 数据查询接口（受 x402 保护）
+// GET /data — 数据查询接口
+//
+// 路径一：无 X-Payment-Proof
+//   - 在限速内（< 2次/min）→ 免费慢通道，加 400ms 延迟，返回数据
+//   - 超出限速 → 429 + 付款提示，建议 Agent 自动升级到付费通道
+//
+// 路径二：有 X-Payment-Proof
+//   - 验证 tx hash → 跳过限速，立即返回数据（优先通道）
 func handleData(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
 	if query == "" {
 		query = "default"
 	}
 
-	// 检查付款证明
 	proof := r.Header.Get("X-Payment-Proof")
-	if proof == "" {
-		// 没有证明 → 返回 402
+	// 只取 IP，去掉端口，避免同一客户端被识别为多个
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr
+	}
+
+	// ── 付费优先通道 ──────────────────────────────────────────────────────────
+	if proof != "" {
+		log.Printf("[paid] query=%q tx=%s — verifying", query, proof)
+		if err := verifyPayment(proof); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusPaymentRequired)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error":  "payment verification failed",
+				"detail": err.Error(),
+			})
+			log.Printf("[402] verification failed: %v", err)
+			return
+		}
+		// 付款验证通过 → 立即响应，不限速
+		serveData(w, query, proof, "priority")
+		return
+	}
+
+	// ── 免费通道：先过限速检查 ────────────────────────────────────────────────
+	if !rateLimiter.Allow(ip) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusPaymentRequired)
-		json.NewEncoder(w).Encode(PaymentRequired{
-			Error:          "Payment required",
-			PaymentAddress: PaymentAddress,
-			Amount:         RequiredAmount,
-			TokenID:        TokenID,
-			ChainID:        ChainID,
-			Instructions:   fmt.Sprintf("Transfer %s %s to %s on %s, then retry with X-Payment-Proof: <tx_hash>", RequiredAmount, TokenID, PaymentAddress, ChainID),
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error":           "rate_limit_exceeded",
+			"message":         "Free tier: 2 requests/min. Pay to unlock priority access.",
+			"payment_address": PaymentAddress,
+			"amount":          RequiredAmount,
+			"token":           TokenID,
+			"chain":           ChainID,
+			"instructions":    fmt.Sprintf("Transfer %s %s to %s on %s, then retry with X-Payment-Proof: <tx_hash>", RequiredAmount, TokenID, PaymentAddress, ChainID),
 		})
-		log.Printf("[402] query=%q — payment required", query)
+		log.Printf("[429] query=%q ip=%s — rate limited, payment suggested", query, ip)
 		return
 	}
 
-	// 有证明 → 验证 tx hash
-	log.Printf("[verify] query=%q tx_hash=%s", query, proof)
-	if err := verifyPayment(proof); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"payment verification failed","detail":"%s"}`, err.Error()), http.StatusPaymentRequired)
-		log.Printf("[402] verification failed: %v", err)
-		return
-	}
+	// 限速内 → 免费慢通道（加人为延迟，体现与付费通道的差距）
+	log.Printf("[free] query=%q ip=%s — slow lane", query, ip)
+	time.Sleep(FreeSlowDelay)
+	serveData(w, query, "", "free")
+}
 
-	// 验证通过 → 获取真实数据
+// serveData 获取数据并返回 200，由付费/免费两条路径共用
+func serveData(w http.ResponseWriter, query, txHash, tier string) {
 	data, source, err := fetchRealData(query)
 	if err != nil {
 		log.Printf("[warn] real data fetch failed: %v, falling back to mock", err)
 		data = map[string]any{
-			"uniswap_usdc_eth_7d_volume": "1,234,567 USDC",
-			"curve_usdc_eth_7d_volume":   "456,789 USDC",
-			"note":                       "Fallback mock data",
+			"uniswap_7d_volume": "1,234,567 USDC",
+			"curve_7d_volume":   "456,789 USDC",
+			"note":              "Fallback mock data",
 		}
 		source = "mock"
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Tier", tier) // 方便 Demo 展示当前通道
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(DataResponse{
 		Query:     query,
 		Data:      data,
 		Source:    source,
-		TxHash:    proof,
+		TxHash:    txHash,
 		Timestamp: time.Now().UTC(),
 	})
-	short := proof
-	if len(proof) > 10 {
-		short = proof[:10] + "..."
+
+	short := txHash
+	if short == "" {
+		short = "(free)"
+	} else if len(short) > 10 {
+		short = short[:10] + "..."
 	}
-	log.Printf("[200] query=%q tx=%s", query, short)
+	log.Printf("[200/%s] query=%q tx=%s source=%s", tier, query, short, source)
 }
 
 // verifyPayment 通过 Etherscan 验证 tx hash
