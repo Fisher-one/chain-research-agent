@@ -42,11 +42,25 @@ SYSTEM_PROMPT = """你是一个链上数据调研 Agent。
 你可以使用 fetch_data 工具查询链上数据。这个工具会自动处理付款，你不需要手动操作钱包。
 
 收到用户的调研请求后：
-1. 用 fetch_data 获取相关数据
-2. 分析数据，生成简洁的分析报告
-3. 报告包括：关键数据、对比结论、数据来源和支付记录
+1. 用 fetch_data 获取相关数据（可多次调用，每次查一个协议或维度）
+2. 对比分析数据，给出有判断的结论——不要只列数字，要说清楚数字背后意味着什么
+3. 按照以下格式输出报告，不要加多余内容：
 
-注意：每次调用 fetch_data 都会产生少量测试网费用（SETH）。"""
+---
+📊 [报告标题]
+
+[2-3 句核心结论，直接给判断，不要废话]
+
+──────────────────────────────
+数据明细
+[用简洁的表格或列表展示关键数字]
+
+分析
+[1-2 段，说清楚数字背后的原因，有对比，有判断]
+──────────────────────────────
+---
+
+注意：每次调用 fetch_data 都会产生少量测试网费用（SETH）。支付记录会在报告末尾自动附上，你不需要在报告里提付款的事。"""
 
 
 def run_agent(user_query: str):
@@ -60,6 +74,8 @@ def run_agent(user_query: str):
     print(f"\n{'='*50}")
     print(f"用户: {user_query}")
     print(f"{'='*50}")
+
+    payments = []  # 追踪每次付款：{cost, tx_hash}
 
     # Agent 循环
     while True:
@@ -96,7 +112,12 @@ def run_agent(user_query: str):
                     else:
                         result = {"error": f"Unknown tool: {fn_name}"}
 
-                    print(f"[工具结果] {json.dumps(result, ensure_ascii=False)[:200]}...")
+                    # 记录付款信息（如果这次调用触发了链上支付）
+                    if result.get("tx_hash"):
+                        payments.append({
+                            "cost": result.get("cost", "?"),
+                            "tx_hash": result["tx_hash"]
+                        })
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -113,7 +134,19 @@ def run_agent(user_query: str):
             # Agent 完成
             break
 
-    print(f"\n{'='*50}")
+    # 支付摘要页脚
+    print(f"\n{'─'*50}")
+    if payments:
+        total = len(payments)
+        print(f"💰 本次调研共产生 {total} 笔链上支付")
+        for i, p in enumerate(payments, 1):
+            short_tx = p['tx_hash'][:12] + "..." if len(p['tx_hash']) > 12 else p['tx_hash']
+            tx_url = f"https://sepolia.etherscan.io/tx/{p['tx_hash']}"
+            print(f"   {i}. {p['cost']}  🔗 {tx_url}")
+        print(f"🔐 Pact 授权保障：每笔上限 0.002 SETH，超出自动拒绝")
+    else:
+        print(f"💡 本次查询走免费通道，未产生链上支付")
+    print(f"{'─'*50}")
 
 
 if __name__ == "__main__":
