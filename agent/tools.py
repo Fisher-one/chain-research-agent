@@ -143,19 +143,23 @@ def fetch_data(query: str) -> dict[str, Any]:
     resp = requests.get(url, params=params)
 
     if resp.status_code == 200:
-        # 直接成功（不需要付款，或已有缓存）
+        # 直接成功（免费额度内）
         return resp.json()
 
-    if resp.status_code != 402:
+    if resp.status_code not in (402, 429):
         raise RuntimeError(f"Unexpected status {resp.status_code}: {resp.text}")
 
-    # Step 2: 收到 402，解析付款要求
+    # Step 2: 收到 402（付费墙）或 429（限速），解析付款要求
+    # 两种情况的响应体结构一样，都包含 payment_address / amount / token_id
     payment_req = resp.json()
     amount = payment_req["amount"]
     token_id = payment_req["token_id"]
     dst_address = payment_req["payment_address"]
 
-    print(f"  💳 需要付款: {amount} {token_id} → {dst_address[:10]}...")
+    if resp.status_code == 429:
+        print(f"  🚦 免费额度用完，升级到优先通道: {amount} {token_id} → {dst_address[:10]}...")
+    else:
+        print(f"  💳 需要付款: {amount} {token_id} → {dst_address[:10]}...")
 
     # Step 3: 提交 Pact
     print(f"  📋 提交 Pact...")
