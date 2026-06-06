@@ -7,32 +7,79 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
 )
 
-// ── 配置 ──────────────────────────────────────────────────────────────────────
+// ── 配置（从环境变量读取，支持多实例） ──────────────────────────────────────────
 
-const (
-	Port            = ":8080"
-	PaymentAddress  = "0x74aae83c8bf22c72a9246b33fc793f20af79e64b" // CAW 钱包地址
-	RequiredAmount  = "0.001"                                        // 收费金额（SETH，测试用）
-	TokenID         = "SETH"
-	ChainID         = "SETH"
+var (
+	PaymentAddress = "0x74aae83c8bf22c72a9246b33fc793f20af79e64b"
 	EtherscanAPIURL = "https://api-sepolia.etherscan.io/api"
 )
+
+// workerConfig 根据 WORKER_TYPE 决定当前实例的身份和价格
+type workerConfig struct {
+	Name        string
+	Type        string
+	Price       string // SETH
+	TokenID     string
+	ChainID     string
+	Specialty   string
+	Keywords    []string
+	Description string
+}
+
+func loadWorkerConfig() workerConfig {
+	t := os.Getenv("WORKER_TYPE")
+	switch t {
+	case "defillama-yields":
+		return workerConfig{
+			Name:        "DefiLlama Yields Worker",
+			Type:        "defillama-yields",
+			Price:       "0.0015",
+			TokenID:     "SETH",
+			ChainID:     "SETH",
+			Specialty:   "DeFi 收益率与 APY 数据",
+			Keywords:    []string{"yield", "apy", "apr", "收益", "利率", "借贷", "lending", "staking"},
+			Description: "查询各 DeFi 协议的实时收益率（APY/APR），覆盖借贷、质押、流动性挖矿，数据来自 DefiLlama Yields API",
+		}
+	case "coingecko":
+		return workerConfig{
+			Name:        "CoinGecko Market Worker",
+			Type:        "coingecko",
+			Price:       "0.002",
+			TokenID:     "SETH",
+			ChainID:     "SETH",
+			Specialty:   "代币价格、市值与 24h 涨跌幅",
+			Keywords:    []string{"price", "价格", "market cap", "市值", "涨跌", "24h", "token", "币价"},
+			Description: "查询代币实时价格、市值排名、24h 交易量和涨跌幅，数据来自 CoinGecko 免费 API",
+		}
+	default: // defillama-protocols（默认）
+		return workerConfig{
+			Name:        "DefiLlama Protocols Worker",
+			Type:        "defillama-protocols",
+			Price:       "0.001",
+			TokenID:     "SETH",
+			ChainID:     "SETH",
+			Specialty:   "DeFi 协议 TVL 与 DEX 交易量",
+			Keywords:    []string{"tvl", "volume", "交易量", "流动性", "dex", "uniswap", "curve", "defi", "protocol"},
+			Description: "查询主流 DeFi 协议的 TVL（总锁仓量）和 DEX 7日交易量，数据来自 DefiLlama API，更新及时",
+		}
+	}
+}
 
 // ── 限速器 ────────────────────────────────────────────────────────────────────
 
 const (
-	FreeRateLimit   = 2              // 免费通道：每分钟最多 2 次
-	FreeRateWindow  = time.Minute
-	FreeSlowDelay   = 400 * time.Millisecond // 免费通道人为延迟，体现差距
+	FreeRateLimit = 2
+	FreeRateWindow = time.Minute
+	FreeSlowDelay  = 400 * time.Millisecond
 )
 
-// RateLimiter 滑动窗口限速，按 IP 计数
 type RateLimiter struct {
 	mu       sync.Mutex
 	requests map[string][]time.Time
@@ -40,43 +87,27 @@ type RateLimiter struct {
 
 var rateLimiter = &RateLimiter{requests: make(map[string][]time.Time)}
 
-// Allow 返回 true 表示本次请求放行；false 表示已超限
 func (rl *RateLimiter) Allow(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-
 	now := time.Now()
 	cutoff := now.Add(-FreeRateWindow)
-
 	var recent []time.Time
 	for _, t := range rl.requests[ip] {
 		if t.After(cutoff) {
 			recent = append(recent, t)
 		}
 	}
-
 	if len(recent) >= FreeRateLimit {
 		rl.requests[ip] = recent
 		return false
 	}
-
 	rl.requests[ip] = append(recent, now)
 	return true
 }
 
 // ── 数据结构 ──────────────────────────────────────────────────────────────────
 
-// 402 响应体：告诉客户端付多少钱、付给谁
-type PaymentRequired struct {
-	Error          string `json:"error"`
-	PaymentAddress string `json:"payment_address"`
-	Amount         string `json:"amount"`
-	TokenID        string `json:"token_id"`
-	ChainID        string `json:"chain_id"`
-	Instructions   string `json:"instructions"`
-}
-
-// 数据响应体
 type DataResponse struct {
 	Query     string    `json:"query"`
 	Data      any       `json:"data"`
@@ -85,28 +116,40 @@ type DataResponse struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// Etherscan API 响应
-type EtherscanTxResponse struct {
-	Status  string `json:"status"`
-	Message string `json:"message"`
-	Result  struct {
-		Hash  string `json:"hash"`
-		From  string `json:"from"`
-		To    string `json:"to"`
-		Value string `json:"value"`
-	} `json:"result"`
-}
-
 // ── 处理器 ────────────────────────────────────────────────────────────────────
 
-// GET /data — 数据查询接口
-//
-// 路径一：无 X-Payment-Proof
-//   - 在限速内（< 2次/min）→ 免费慢通道，加 400ms 延迟，返回数据
-//   - 超出限速 → 429 + 付款提示，建议 Agent 自动升级到付费通道
-//
-// 路径二：有 X-Payment-Proof
-//   - 验证 tx hash → 跳过限速，立即返回数据（优先通道）
+var cfg workerConfig
+
+// GET /catalog — Worker 自我描述，供 Agent 动态发现
+func handleCatalog(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"name":            cfg.Name,
+		"worker_type":     cfg.Type,
+		"specialty":       cfg.Specialty,
+		"keywords":        cfg.Keywords,
+		"price":           fmt.Sprintf("%s %s", cfg.Price, cfg.TokenID),
+		"price_amount":    cfg.Price,
+		"token_id":        cfg.TokenID,
+		"chain_id":        cfg.ChainID,
+		"payment_address": PaymentAddress,
+		"description":     cfg.Description,
+		"status":          "online",
+	})
+}
+
+// GET /health — 健康检查
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":          "ok",
+		"worker":          cfg.Name,
+		"payment_address": PaymentAddress,
+		"price":           fmt.Sprintf("%s %s", cfg.Price, cfg.TokenID),
+	})
+}
+
+// GET /data — 数据查询接口（x402 保护）
 func handleData(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
 	if query == "" {
@@ -114,31 +157,27 @@ func handleData(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proof := r.Header.Get("X-Payment-Proof")
-	// 只取 IP，去掉端口，避免同一客户端被识别为多个
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		ip = r.RemoteAddr
 	}
 
-	// ── 付费优先通道 ──────────────────────────────────────────────────────────
+	// 付费优先通道
 	if proof != "" {
-		log.Printf("[paid] query=%q tx=%s — verifying", query, proof)
+		log.Printf("[paid] query=%q tx=%s", query, proof)
 		if err := verifyPayment(proof); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusPaymentRequired)
 			json.NewEncoder(w).Encode(map[string]string{
-				"error":  "payment verification failed",
-				"detail": err.Error(),
+				"error": "payment verification failed", "detail": err.Error(),
 			})
-			log.Printf("[402] verification failed: %v", err)
 			return
 		}
-		// 付款验证通过 → 立即响应，不限速
 		serveData(w, query, proof, "priority")
 		return
 	}
 
-	// ── 免费通道：先过限速检查 ────────────────────────────────────────────────
+	// 免费通道：限速检查
 	if !rateLimiter.Allow(ip) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", "60")
@@ -147,36 +186,31 @@ func handleData(w http.ResponseWriter, r *http.Request) {
 			"error":           "rate_limit_exceeded",
 			"message":         "Free tier: 2 requests/min. Pay to unlock priority access.",
 			"payment_address": PaymentAddress,
-			"amount":          RequiredAmount,
-			"token":           TokenID,
-			"chain":           ChainID,
-			"instructions":    fmt.Sprintf("Transfer %s %s to %s on %s, then retry with X-Payment-Proof: <tx_hash>", RequiredAmount, TokenID, PaymentAddress, ChainID),
+			"amount":          cfg.Price,
+			"token_id":        cfg.TokenID,
+			"chain":           cfg.ChainID,
+			"instructions":    fmt.Sprintf("Transfer %s %s to %s on %s, retry with X-Payment-Proof: <tx_hash>", cfg.Price, cfg.TokenID, PaymentAddress, cfg.ChainID),
 		})
-		log.Printf("[429] query=%q ip=%s — rate limited, payment suggested", query, ip)
+		log.Printf("[429] query=%q ip=%s", query, ip)
 		return
 	}
 
-	// 限速内 → 免费慢通道（加人为延迟，体现与付费通道的差距）
-	log.Printf("[free] query=%q ip=%s — slow lane", query, ip)
+	log.Printf("[free] query=%q ip=%s", query, ip)
 	time.Sleep(FreeSlowDelay)
 	serveData(w, query, "", "free")
 }
 
-// serveData 获取数据并返回 200，由付费/免费两条路径共用
 func serveData(w http.ResponseWriter, query, txHash, tier string) {
-	data, source, err := fetchRealData(query)
+	data, source, err := fetchData(query)
 	if err != nil {
-		log.Printf("[warn] real data fetch failed: %v, falling back to mock", err)
-		data = map[string]any{
-			"uniswap_7d_volume": "1,234,567 USDC",
-			"curve_7d_volume":   "456,789 USDC",
-			"note":              "Fallback mock data",
-		}
-		source = "mock"
+		log.Printf("[warn] fetch failed: %v", err)
+		http.Error(w, `{"error":"data fetch failed","detail":"`+err.Error()+`"}`, http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Tier", tier) // 方便 Demo 展示当前通道
+	w.Header().Set("X-Tier", tier)
+	w.Header().Set("X-Worker", cfg.Name)
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(DataResponse{
 		Query:     query,
@@ -195,180 +229,283 @@ func serveData(w http.ResponseWriter, query, txHash, tier string) {
 	log.Printf("[200/%s] query=%q tx=%s source=%s", tier, query, short, source)
 }
 
-// verifyPayment 通过 Etherscan 验证 tx hash
-// 检查：tx 存在 + 接收方是我们的收款地址
-func verifyPayment(txHash string) error {
-	// 开发模式：跳过验证（tx hash 以 "test_" 开头）
-	if strings.HasPrefix(txHash, "test_") {
-		log.Printf("[verify] dev mode — skipping verification for %s", txHash)
-		return nil
-	}
+// ── 数据获取：根据 WORKER_TYPE 调用不同 API ────────────────────────────────────
 
-	apiKey := os.Getenv("ETHERSCAN_API_KEY") // 可选，没有也能查，有了速率更高
-	url := fmt.Sprintf("%s?module=proxy&action=eth_getTransactionByHash&txhash=%s&apikey=%s",
-		EtherscanAPIURL, txHash, apiKey)
-
-	resp, err := http.Get(url)
-	if err != nil {
-		return fmt.Errorf("etherscan request failed: %w", err)
+func fetchData(query string) (map[string]any, string, error) {
+	switch cfg.Type {
+	case "defillama-yields":
+		return fetchYieldsData(query)
+	case "coingecko":
+		return fetchCoinGeckoData(query)
+	default:
+		return fetchProtocolsData(query)
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	// Etherscan 有时返回 result 为字符串（限速或错误时）
-	// 用 RawMessage 先拿到 result 字段，再判断类型
-	var raw struct {
-		Result json.RawMessage `json:"result"`
-	}
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return fmt.Errorf("parse response failed: %w", err)
-	}
-
-	if raw.Result == nil || string(raw.Result) == "null" {
-		return fmt.Errorf("transaction not found: %s", txHash)
-	}
-
-	// 如果 result 是字符串（限速错误等），宽松通过
-	if raw.Result[0] == '"' {
-		log.Printf("[verify] etherscan returned string result, accepting tx (dev mode): %s", string(raw.Result))
-		return nil
-	}
-
-	// 正常情况：result 是对象
-	var tx struct {
-		Hash string `json:"hash"`
-		To   string `json:"to"`
-	}
-	if err := json.Unmarshal(raw.Result, &tx); err != nil {
-		return fmt.Errorf("parse tx failed: %w", err)
-	}
-
-	// 验证接收方地址
-	if !strings.EqualFold(tx.To, PaymentAddress) {
-		return fmt.Errorf("wrong destination: got %s, want %s", tx.To, PaymentAddress)
-	}
-
-	return nil
 }
 
-// fetchRealData 从 DefiLlama 获取真实的协议数据
-func fetchRealData(query string) (map[string]any, string, error) {
+// Worker 1: DefiLlama 协议 TVL + DEX 交易量
+func fetchProtocolsData(query string) (map[string]any, string, error) {
 	q := strings.ToLower(query)
-
-	// 判断查询意图：Uniswap、Curve 或两者对比
 	wantUniswap := strings.Contains(q, "uniswap")
 	wantCurve := strings.Contains(q, "curve")
-
 	result := map[string]any{}
 
 	if wantUniswap || (!wantUniswap && !wantCurve) {
-		tvl, vol, err := fetchProtocolData("uniswap")
+		tvl, vol, err := fetchProtocolTVL("uniswap")
 		if err != nil {
 			return nil, "", fmt.Errorf("uniswap: %w", err)
 		}
 		result["uniswap"] = tvl
 		result["uniswap_7d_volume_usd"] = vol
 	}
-
 	if wantCurve || (!wantUniswap && !wantCurve) {
-		tvl, vol, err := fetchProtocolData("curve")
+		tvl, vol, err := fetchProtocolTVL("curve")
 		if err != nil {
 			return nil, "", fmt.Errorf("curve: %w", err)
 		}
 		result["curve"] = tvl
 		result["curve_7d_volume_usd"] = vol
 	}
-
-	result["source_note"] = "Real data from DefiLlama API"
-	result["query"] = query
-	return result, "defillama", nil
+	result["data_type"] = "TVL & DEX Volume"
+	return result, "defillama-protocols", nil
 }
 
-// fetchProtocolData 从 DefiLlama 获取协议的 TVL 和交易量
-func fetchProtocolData(protocol string) (tvlData map[string]any, volume string, err error) {
-	// 获取 TVL（Curve 的 slug 是 curve-dex）
-	tvlSlug := protocol
+func fetchProtocolTVL(protocol string) (map[string]any, string, error) {
+	slug := protocol
 	if protocol == "curve" {
-		tvlSlug = "curve-dex"
+		slug = "curve-dex"
 	}
-	tvlURL := fmt.Sprintf("https://api.llama.fi/protocol/%s", tvlSlug)
-	resp, err := http.Get(tvlURL)
+	resp, err := http.Get("https://api.llama.fi/protocol/" + slug)
 	if err != nil {
 		return nil, "", err
 	}
 	defer resp.Body.Close()
-
 	body, _ := io.ReadAll(resp.Body)
 	var data map[string]any
 	if err := json.Unmarshal(body, &data); err != nil {
 		return nil, "", err
 	}
-
 	tvl := map[string]any{
-		"name":        data["name"],
-		"current_tvl": data["tvl"],
-		"category":    data["category"],
+		"name": data["name"], "current_tvl": data["tvl"], "category": data["category"],
 	}
 
-	// 获取 7日交易量（dex volume）
-	// Curve 在 DefiLlama 的 DEX 名称是 curve-dex
-	dexName := protocol
-	if protocol == "curve" {
-		dexName = "curve-dex"
-	}
+	dexName := slug
 	volURL := fmt.Sprintf("https://api.llama.fi/summary/dexs/%s?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true&dataType=dailyVolume", dexName)
 	resp2, err := http.Get(volURL)
 	if err != nil {
-		return tvl, "N/A", nil // 交易量获取失败不影响 TVL
-	}
-	defer resp2.Body.Close()
-
-	body2, _ := io.ReadAll(resp2.Body)
-	var volData map[string]any
-	if err := json.Unmarshal(body2, &volData); err != nil {
 		return tvl, "N/A", nil
 	}
-
-	total7d := volData["total7d"]
-	if total7d != nil {
-		volume = fmt.Sprintf("$%.0f", total7d)
-	} else {
-		volume = "N/A"
+	defer resp2.Body.Close()
+	body2, _ := io.ReadAll(resp2.Body)
+	var volData map[string]any
+	json.Unmarshal(body2, &volData)
+	vol := "N/A"
+	if v := volData["total7d"]; v != nil {
+		vol = fmt.Sprintf("$%.0f", v)
 	}
-
-	return tvl, volume, nil
+	return tvl, vol, nil
 }
 
-// GET /health — 健康检查
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":          "ok",
-		"payment_address": PaymentAddress,
-		"price":           fmt.Sprintf("%s %s", RequiredAmount, TokenID),
-	})
+// Worker 2: DefiLlama Yields — APY/收益率数据
+func fetchYieldsData(query string) (map[string]any, string, error) {
+	resp, err := http.Get("https://yields.llama.fi/pools")
+	if err != nil {
+		return nil, "", fmt.Errorf("yields API failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var raw struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, "", fmt.Errorf("parse yields failed: %w", err)
+	}
+
+	q := strings.ToLower(query)
+
+	// 按 query 关键词过滤相关协议，取 APY 前10
+	var matched []map[string]any
+	for _, pool := range raw.Data {
+		project := strings.ToLower(fmt.Sprintf("%v", pool["project"]))
+		symbol := strings.ToLower(fmt.Sprintf("%v", pool["symbol"]))
+		chain := strings.ToLower(fmt.Sprintf("%v", pool["chain"]))
+
+		if strings.Contains(project, "uniswap") && strings.Contains(q, "uniswap") ||
+			strings.Contains(project, "curve") && strings.Contains(q, "curve") ||
+			strings.Contains(project, "aave") && strings.Contains(q, "aave") ||
+			strings.Contains(project, "compound") && strings.Contains(q, "compound") ||
+			strings.Contains(symbol, "eth") && strings.Contains(q, "eth") ||
+			strings.Contains(chain, "ethereum") && (strings.Contains(q, "ethereum") || strings.Contains(q, "eth")) {
+			matched = append(matched, map[string]any{
+				"project": pool["project"],
+				"symbol":  pool["symbol"],
+				"chain":   pool["chain"],
+				"apy":     pool["apy"],
+				"tvlUsd":  pool["tvlUsd"],
+			})
+		}
+		if len(matched) >= 10 {
+			break
+		}
+	}
+
+	// 如果没有关键词匹配，返回全网 APY 最高的10个
+	if len(matched) == 0 {
+		type poolAPY struct {
+			data map[string]any
+			apy  float64
+		}
+		var pools []poolAPY
+		for _, pool := range raw.Data {
+			apy, _ := pool["apy"].(float64)
+			if apy > 0 && apy < 1000 { // 过滤异常值
+				pools = append(pools, poolAPY{pool, apy})
+			}
+		}
+		// 简单取前10高APY
+		count := 0
+		for i := len(pools) - 1; i >= 0 && count < 10; i-- {
+			p := pools[i]
+			matched = append(matched, map[string]any{
+				"project": p.data["project"],
+				"symbol":  p.data["symbol"],
+				"chain":   p.data["chain"],
+				"apy":     p.data["apy"],
+				"tvlUsd":  p.data["tvlUsd"],
+			})
+			count++
+		}
+	}
+
+	return map[string]any{
+		"data_type":   "DeFi Yields & APY",
+		"query":       query,
+		"pools":       matched,
+		"total_pools": len(raw.Data),
+	}, "defillama-yields", nil
+}
+
+// Worker 3: CoinGecko — 代币价格、市值
+func fetchCoinGeckoData(query string) (map[string]any, string, error) {
+	// 从 query 里提取代币名称，映射到 CoinGecko ID
+	coinMap := map[string]string{
+		"uniswap": "uniswap",
+		"uni":     "uniswap",
+		"curve":   "curve-dao-token",
+		"crv":     "curve-dao-token",
+		"aave":    "aave",
+		"eth":     "ethereum",
+		"ethereum": "ethereum",
+		"btc":     "bitcoin",
+		"bitcoin": "bitcoin",
+		"matic":   "matic-network",
+		"polygon": "matic-network",
+		"arb":     "arbitrum",
+		"arbitrum": "arbitrum",
+		"op":      "optimism",
+		"optimism": "optimism",
+	}
+
+	q := strings.ToLower(query)
+	var ids []string
+	seen := map[string]bool{}
+	for keyword, cgID := range coinMap {
+		if strings.Contains(q, keyword) && !seen[cgID] {
+			ids = append(ids, cgID)
+			seen[cgID] = true
+		}
+	}
+	// 默认查几个主流代币
+	if len(ids) == 0 {
+		ids = []string{"uniswap", "curve-dao-token", "aave", "ethereum"}
+	}
+
+	apiURL := fmt.Sprintf(
+		"https://api.coingecko.com/api/v3/simple/price?ids=%s&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true&include_market_cap=true",
+		url.QueryEscape(strings.Join(ids, ",")),
+	)
+
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("CoinGecko API failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 429 {
+		return nil, "", fmt.Errorf("CoinGecko rate limited, try again in 60s")
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var prices map[string]map[string]any
+	if err := json.Unmarshal(body, &prices); err != nil {
+		return nil, "", fmt.Errorf("parse CoinGecko response failed: %w", err)
+	}
+
+	return map[string]any{
+		"data_type": "Token Prices & Market Data",
+		"query":     query,
+		"prices":    prices,
+		"source_note": "Real-time data from CoinGecko free API",
+	}, "coingecko", nil
+}
+
+// ── 支付验证 ──────────────────────────────────────────────────────────────────
+
+func verifyPayment(txHash string) error {
+	if strings.HasPrefix(txHash, "test_") {
+		log.Printf("[verify] dev mode — skip for %s", txHash)
+		return nil
+	}
+	apiKey := os.Getenv("ETHERSCAN_API_KEY")
+	apiURL := fmt.Sprintf("%s?module=proxy&action=eth_getTransactionByHash&txhash=%s&apikey=%s",
+		EtherscanAPIURL, txHash, apiKey)
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		return fmt.Errorf("etherscan request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var raw struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return fmt.Errorf("parse response failed: %w", err)
+	}
+	if raw.Result == nil || string(raw.Result) == "null" {
+		return fmt.Errorf("transaction not found: %s", txHash)
+	}
+	if raw.Result[0] == '"' {
+		log.Printf("[verify] etherscan rate limited, accepting tx: %s", txHash)
+		return nil
+	}
+	var tx struct {
+		To string `json:"to"`
+	}
+	if err := json.Unmarshal(raw.Result, &tx); err != nil {
+		return fmt.Errorf("parse tx failed: %w", err)
+	}
+	if !strings.EqualFold(tx.To, PaymentAddress) {
+		return fmt.Errorf("wrong destination: got %s, want %s", tx.To, PaymentAddress)
+	}
+	return nil
 }
 
 // ── 主函数 ────────────────────────────────────────────────────────────────────
 
 func main() {
-	// 支持通过环境变量指定端口和 Worker 名称（多实例部署用）
+	cfg = loadWorkerConfig()
+
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = Port
-	}
-	workerName := os.Getenv("WORKER_NAME")
-	if workerName == "" {
-		workerName = "x402 Data Worker"
+		port = ":8080"
 	}
 
-	http.HandleFunc("/data", handleData)
+	http.HandleFunc("/catalog", handleCatalog)
 	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/data", handleData)
 
-	log.Printf("[%s] starting on %s", workerName, port)
-	log.Printf("payment address: %s", PaymentAddress)
-	log.Printf("price: %s %s on %s", RequiredAmount, TokenID, ChainID)
+	log.Printf("[%s] starting on %s | specialty: %s | price: %s %s",
+		cfg.Name, port, cfg.Specialty, cfg.Price, cfg.TokenID)
 
 	if err := http.ListenAndServe(port, nil); err != nil {
 		log.Fatal(err)

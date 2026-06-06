@@ -18,7 +18,7 @@ import time
 import requests
 from typing import Any
 
-from registry import DATA_WORKERS, get_worker, list_workers_summary
+from registry import discover_workers, KNOWN_WORKER_URLS
 
 X402_SERVER_URL = os.getenv("X402_SERVER_URL", "http://localhost:8080")
 
@@ -194,18 +194,24 @@ def fetch_data(query: str) -> dict[str, Any]:
 
 def list_data_workers() -> list[dict]:
     """
-    列出所有可用的数据 Worker 及其价格、专长、延迟。
+    动态发现当前在线的数据 Worker，获取其价格和专长。
 
-    Agent 应在 hire_worker() 之前调用这个工具，
-    根据任务需求和预算选择最合适的 Worker。
+    实际向每个已知 Worker 地址发 GET /catalog 请求。
+    只返回当前在线且响应正常的 Worker——下线的自动不出现。
 
     Returns:
-        list: 每个元素包含 worker_id, name, specialty, price, latency, description
+        list: 在线 Worker 信息，每项含 worker_id, name, specialty, price, description
     """
-    workers = list_workers_summary()
-    print(f"  🔍 发现 {len(workers)} 个可用 Data Worker:")
+    print(f"  🔍 探测 {len(KNOWN_WORKER_URLS)} 个已知 Worker 地址...")
+    workers = discover_workers()
+
+    if not workers:
+        print(f"  ⚠️  没有在线的 Worker，请先运行 ./start-workers.sh")
+        return []
+
+    print(f"  📡 发现 {len(workers)} 个在线 Worker:")
     for w in workers:
-        print(f"     · {w['name']} ({w['price']}, {w['latency']}) — {w['specialty']}")
+        print(f"     · {w['name']} ({w['price']}) — {w['specialty']}")
     return workers
 
 
@@ -220,10 +226,12 @@ def hire_worker(worker_id: str, query: str) -> dict[str, Any]:
     Returns:
         dict: 数据结果，包含 data、tx_hash、cost、worker 字段
     """
-    worker = get_worker(worker_id)
+    # 实时探测，找到对应 worker_id 的在线 Worker
+    all_workers = discover_workers()
+    worker = next((w for w in all_workers if w["worker_id"] == worker_id), None)
     if not worker:
-        available = list(DATA_WORKERS.keys())
-        raise ValueError(f"Worker '{worker_id}' 不存在。可用的 Worker: {available}")
+        available = [w["worker_id"] for w in all_workers]
+        raise ValueError(f"Worker '{worker_id}' 不在线或不存在。当前在线: {available}")
 
     print(f"\n  🤝 雇用 {worker['name']} ({worker['price']})")
     print(f"  📡 查询: {query}")
