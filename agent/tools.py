@@ -1,11 +1,15 @@
 """
-fetch_data() — x402 支付工具
+tools.py — Agent 工具集
 
-Agent 调用这个函数时，内部自动处理：
-  1. 请求 x402 server → 收到 402
-  2. 用 CAW 提交 Pact + 发转账 → 拿到 tx_hash
-  3. 带 X-Payment-Proof 重发请求 → 拿到数据
-Agent 只看到数据返回，不需要知道 402 存在。
+包含三个工具：
+  list_data_workers() — 发现可用数据服务（价格、专长）
+  hire_worker()       — 雇用指定 Worker，自动处理 x402 支付
+  fetch_data()        — 原始单服务查询（向后兼容，内部调用 hire_worker）
+
+Agent 的采购流程：
+  1. list_data_workers() 发现有哪些 Worker、各自什么价
+  2. 根据任务和预算选择最合适的 Worker
+  3. hire_worker() 发起请求，自动付款，拿回数据
 """
 import json
 import os
@@ -13,6 +17,8 @@ import subprocess
 import time
 import requests
 from typing import Any
+
+from registry import DATA_WORKERS, get_worker, list_workers_summary
 
 X402_SERVER_URL = os.getenv("X402_SERVER_URL", "http://localhost:8080")
 
@@ -181,4 +187,89 @@ def fetch_data(query: str) -> dict[str, Any]:
     result = resp2.json()
     result["tx_hash"] = tx_hash
     result["cost"] = f"{amount} {token_id}"
+    return result
+
+
+# ── 新工具：发现 + 雇用 ────────────────────────────────────────────────────────
+
+def list_data_workers() -> list[dict]:
+    """
+    列出所有可用的数据 Worker 及其价格、专长、延迟。
+
+    Agent 应在 hire_worker() 之前调用这个工具，
+    根据任务需求和预算选择最合适的 Worker。
+
+    Returns:
+        list: 每个元素包含 worker_id, name, specialty, price, latency, description
+    """
+    workers = list_workers_summary()
+    print(f"  🔍 发现 {len(workers)} 个可用 Data Worker:")
+    for w in workers:
+        print(f"     · {w['name']} ({w['price']}, {w['latency']}) — {w['specialty']}")
+    return workers
+
+
+def hire_worker(worker_id: str, query: str) -> dict[str, Any]:
+    """
+    雇用指定的 Data Worker 完成查询，自动处理 x402 支付。
+
+    Args:
+        worker_id: Worker 的 ID（从 list_data_workers 获取）
+        query: 查询内容
+
+    Returns:
+        dict: 数据结果，包含 data、tx_hash、cost、worker 字段
+    """
+    worker = get_worker(worker_id)
+    if not worker:
+        available = list(DATA_WORKERS.keys())
+        raise ValueError(f"Worker '{worker_id}' 不存在。可用的 Worker: {available}")
+
+    print(f"\n  🤝 雇用 {worker['name']} ({worker['price']})")
+    print(f"  📡 查询: {query}")
+
+    # 直接复用 fetch_data 的 x402 支付逻辑，只是把 URL 换成指定 Worker 的地址
+    url = f"{worker['url']}/data"
+    params = {"q": query}
+
+    resp = requests.get(url, params=params)
+
+    if resp.status_code == 200:
+        result = resp.json()
+        result["worker"] = worker_id
+        result["worker_name"] = worker["name"]
+        return result
+
+    if resp.status_code not in (402, 429):
+        raise RuntimeError(f"Worker {worker_id} 返回异常: {resp.status_code} {resp.text}")
+
+    payment_req = resp.json()
+    amount = payment_req["amount"]
+    token_id = payment_req["token_id"]
+    dst_address = payment_req["payment_address"]
+
+    if resp.status_code == 429:
+        print(f"  🚦 免费额度用完，升级优先通道: {amount} {token_id} → {dst_address[:10]}...")
+    else:
+        print(f"  💳 支付给 {worker['name']}: {amount} {token_id} → {dst_address[:10]}...")
+
+    print(f"  📋 提交 Pact...")
+    pact_id = _submit_pact(amount, token_id, dst_address)
+    print(f"  ✅ Pact 激活: {pact_id[:8]}...")
+
+    print(f"  💸 链上转账...")
+    tx_hash = _pay(pact_id, amount, token_id, dst_address)
+    print(f"  ✅ 支付成功: {tx_hash[:12]}...")
+
+    print(f"  🔄 取回数据...")
+    resp2 = requests.get(url, params=params, headers={"X-Payment-Proof": tx_hash})
+
+    if resp2.status_code != 200:
+        raise RuntimeError(f"数据获取失败: {resp2.status_code} {resp2.text}")
+
+    result = resp2.json()
+    result["tx_hash"] = tx_hash
+    result["cost"] = f"{amount} {token_id}"
+    result["worker"] = worker_id
+    result["worker_name"] = worker["name"]
     return result

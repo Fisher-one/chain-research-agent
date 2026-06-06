@@ -8,7 +8,7 @@ import json
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
-from tools import fetch_data
+from tools import fetch_data, list_data_workers, hire_worker
 
 load_dotenv()
 
@@ -19,32 +19,52 @@ LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
 # Agent 工具定义（告诉 LLM 有哪些工具可以调用）
 TOOLS = [
     {
-        "name": "fetch_data",
+        "name": "list_data_workers",
         "description": (
-            "查询链上数据（DEX 交易量、流动性、价格等）。"
-            "会自动处理付费数据源的 x402 支付，Agent 只需提供查询内容。"
+            "列出所有可用的数据 Worker 及其价格、专长、延迟。"
+            "在 hire_worker 之前必须先调用这个工具，了解有哪些选择。"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "hire_worker",
+        "description": (
+            "雇用指定的数据 Worker 完成查询任务，自动处理 x402 支付和链上转账。"
+            "请根据 list_data_workers 的结果选择最适合任务的 Worker。"
         ),
         "input_schema": {
             "type": "object",
             "properties": {
+                "worker_id": {
+                    "type": "string",
+                    "description": "Worker 的 ID，从 list_data_workers 获取"
+                },
                 "query": {
                     "type": "string",
-                    "description": "查询内容，例如：Uniswap USDC/ETH 7天交易量对比 Curve"
+                    "description": "查询内容，例如：Uniswap vs Curve 7天交易量对比"
                 }
             },
-            "required": ["query"]
+            "required": ["worker_id", "query"]
         }
-    }
+    },
 ]
 
-SYSTEM_PROMPT = """你是一个链上数据调研 Agent。
+SYSTEM_PROMPT = """你是一个链上数据调研 Agent，能自主发现、比价并采购数据服务。
 
-你可以使用 fetch_data 工具查询链上数据。这个工具会自动处理付款，你不需要手动操作钱包。
+你有两个工具：
+- list_data_workers：列出所有可用的数据 Worker 及其价格和专长
+- hire_worker：雇用指定 Worker 完成查询，自动处理链上支付
 
-收到用户的调研请求后：
-1. 用 fetch_data 获取相关数据（可多次调用，每次查一个协议或维度）
-2. 对比分析数据，给出有判断的结论——不要只列数字，要说清楚数字背后意味着什么
-3. 按照以下格式输出报告，不要加多余内容：
+收到用户的调研请求后，按以下步骤执行：
+1. 先调用 list_data_workers，了解有哪些数据服务可用、各自多少钱
+2. 根据任务需求选择最合适的 Worker（专长匹配 + 价格合理），说明你的选择理由
+3. 调用 hire_worker 雇用选中的 Worker，获取数据
+4. 分析数据，给出有判断的结论——不要只列数字，要说清楚背后意味着什么
+5. 按照以下格式输出报告：
 
 ---
 📊 [报告标题]
@@ -107,7 +127,11 @@ def run_agent(user_query: str):
                 fn_args = json.loads(tc.function.arguments)
                 print(f"\n[工具调用] {fn_name}({fn_args})")
                 try:
-                    if fn_name == "fetch_data":
+                    if fn_name == "list_data_workers":
+                        result = list_data_workers()
+                    elif fn_name == "hire_worker":
+                        result = hire_worker(**fn_args)
+                    elif fn_name == "fetch_data":
                         result = fetch_data(**fn_args)
                     else:
                         result = {"error": f"Unknown tool: {fn_name}"}

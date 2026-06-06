@@ -353,15 +353,24 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // ── 主函数 ────────────────────────────────────────────────────────────────────
 
 func main() {
+	// 支持通过环境变量指定端口和 Worker 名称（多实例部署用）
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = Port
+	}
+	workerName := os.Getenv("WORKER_NAME")
+	if workerName == "" {
+		workerName = "x402 Data Worker"
+	}
+
 	http.HandleFunc("/data", handleData)
 	http.HandleFunc("/health", handleHealth)
 
-	log.Printf("x402 server starting on %s", Port)
+	log.Printf("[%s] starting on %s", workerName, port)
 	log.Printf("payment address: %s", PaymentAddress)
 	log.Printf("price: %s %s on %s", RequiredAmount, TokenID, ChainID)
-	log.Printf("endpoints: GET /data?q=<query>  GET /health")
 
-	if err := http.ListenAndServe(Port, nil); err != nil {
+	if err := http.ListenAndServe(port, nil); err != nil {
 		log.Fatal(err)
 	}
 }
