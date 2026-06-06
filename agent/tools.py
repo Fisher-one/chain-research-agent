@@ -51,7 +51,9 @@ def _caw(args: list) -> dict:
 
 
 def _submit_pact(amount: str, token_id: str, dst_address: str) -> str:
-    """提交 Pact，返回 pact_id"""
+    """提交 Pact，返回 pact_id。
+    约束：目标地址白名单 + 单笔金额上限（两层防线）。
+    """
     policies = json.dumps([{
         "name": "x402-payment",
         "type": "transfer",
@@ -59,7 +61,8 @@ def _submit_pact(amount: str, token_id: str, dst_address: str) -> str:
             "effect": "allow",
             "when": {
                 "chain_in": ["SETH"],
-                "token_in": [{"chain_id": "SETH", "token_id": token_id}]
+                "token_in": [{"chain_id": "SETH", "token_id": token_id}],
+                "dst_address_in": [dst_address],   # 地址白名单：只允许付给本次约定的 Worker
             },
             "deny_if": {"amount_gt": str(float(amount) * 2)}  # 上限是要求金额的 2 倍
         }
