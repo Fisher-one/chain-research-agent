@@ -17,8 +17,11 @@ import (
 // ── 配置（从环境变量读取，支持多实例） ──────────────────────────────────────────
 
 var (
-	PaymentAddress = "0x74aae83c8bf22c72a9246b33fc793f20af79e64b"
+	PaymentAddress  = "0x74aae83c8bf22c72a9246b33fc793f20af79e64b"
 	EtherscanAPIURL = "https://api-sepolia.etherscan.io/api"
+
+	// httpClient 带超时，防止外部 API 慢响应挂死 Worker
+	httpClient = &http.Client{Timeout: 10 * time.Second}
 )
 
 // workerConfig 根据 WORKER_TYPE 决定当前实例的身份和价格
@@ -86,6 +89,38 @@ type RateLimiter struct {
 }
 
 var rateLimiter = &RateLimiter{requests: make(map[string][]time.Time)}
+
+// ── 数据缓存（避免反复调外部 API，Demo 时关键）──────────────────────────────────
+
+type cacheEntry struct {
+	data      map[string]any
+	source    string
+	fetchedAt time.Time
+}
+
+var (
+	dataCache   = map[string]cacheEntry{}
+	dataCacheMu sync.RWMutex
+	cacheTTL    = 5 * time.Minute
+)
+
+func cachedFetch(key string, fetch func() (map[string]any, string, error)) (map[string]any, string, error) {
+	dataCacheMu.RLock()
+	if entry, ok := dataCache[key]; ok && time.Since(entry.fetchedAt) < cacheTTL {
+		dataCacheMu.RUnlock()
+		return entry.data, entry.source, nil
+	}
+	dataCacheMu.RUnlock()
+
+	data, source, err := fetch()
+	if err != nil {
+		return nil, "", err
+	}
+	dataCacheMu.Lock()
+	dataCache[key] = cacheEntry{data: data, source: source, fetchedAt: time.Now()}
+	dataCacheMu.Unlock()
+	return data, source, nil
+}
 
 func (rl *RateLimiter) Allow(ip string) bool {
 	rl.mu.Lock()
@@ -232,13 +267,21 @@ func serveData(w http.ResponseWriter, query, txHash, tier string) {
 // ── 数据获取：根据 WORKER_TYPE 调用不同 API ────────────────────────────────────
 
 func fetchData(query string) (map[string]any, string, error) {
+	// 缓存 key：Worker 类型（同一 Worker 的数据按类型缓存，不按 query，因为数据是全量的）
+	cacheKey := cfg.Type
 	switch cfg.Type {
 	case "defillama-yields":
-		return fetchYieldsData(query)
+		return cachedFetch(cacheKey, func() (map[string]any, string, error) {
+			return fetchYieldsData(query)
+		})
 	case "coingecko":
-		return fetchCoinGeckoData(query)
+		return cachedFetch(cacheKey, func() (map[string]any, string, error) {
+			return fetchCoinGeckoData(query)
+		})
 	default:
-		return fetchProtocolsData(query)
+		return cachedFetch(cacheKey, func() (map[string]any, string, error) {
+			return fetchProtocolsData(query)
+		})
 	}
 }
 
@@ -274,7 +317,7 @@ func fetchProtocolTVL(protocol string) (map[string]any, string, error) {
 	if protocol == "curve" {
 		slug = "curve-dex"
 	}
-	resp, err := http.Get("https://api.llama.fi/protocol/" + slug)
+	resp, err := httpClient.Get("https://api.llama.fi/protocol/" + slug)
 	if err != nil {
 		return nil, "", err
 	}
@@ -290,7 +333,7 @@ func fetchProtocolTVL(protocol string) (map[string]any, string, error) {
 
 	dexName := slug
 	volURL := fmt.Sprintf("https://api.llama.fi/summary/dexs/%s?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true&dataType=dailyVolume", dexName)
-	resp2, err := http.Get(volURL)
+	resp2, err := httpClient.Get(volURL)
 	if err != nil {
 		return tvl, "N/A", nil
 	}
@@ -307,7 +350,7 @@ func fetchProtocolTVL(protocol string) (map[string]any, string, error) {
 
 // Worker 2: DefiLlama Yields — APY/收益率数据
 func fetchYieldsData(query string) (map[string]any, string, error) {
-	resp, err := http.Get("https://yields.llama.fi/pools")
+	resp, err := httpClient.Get("https://yields.llama.fi/pools")
 	if err != nil {
 		return nil, "", fmt.Errorf("yields API failed: %w", err)
 	}
@@ -425,7 +468,7 @@ func fetchCoinGeckoData(query string) (map[string]any, string, error) {
 		url.QueryEscape(strings.Join(ids, ",")),
 	)
 
-	resp, err := http.Get(apiURL)
+	resp, err := httpClient.Get(apiURL)
 	if err != nil {
 		return nil, "", fmt.Errorf("CoinGecko API failed: %w", err)
 	}
@@ -459,7 +502,7 @@ func verifyPayment(txHash string) error {
 	apiKey := os.Getenv("ETHERSCAN_API_KEY")
 	apiURL := fmt.Sprintf("%s?module=proxy&action=eth_getTransactionByHash&txhash=%s&apikey=%s",
 		EtherscanAPIURL, txHash, apiKey)
-	resp, err := http.Get(apiURL)
+	resp, err := httpClient.Get(apiURL)
 	if err != nil {
 		return fmt.Errorf("etherscan request failed: %w", err)
 	}
